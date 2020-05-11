@@ -10,96 +10,47 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 class SacrumNavEnv(gym.Env):
 
     def __init__(self, env_params={}):
-        self.verbose = env_params['verbose']
-        self.chebishev = env_params['chebishev']
 
-        self.resize_x = 272
-        self.resize_y = 258
+        self.set_env_variables(env_params)
+        self.define_reward_function(env_params)
 
-        self.test_patients = env_params['test_patients']
-        self.val_patients = env_params['val_patients']
+        self.set_env_constants()
 
-        print("Validating on {} patients".format(self.val_patients))
-        print("Testing on {} patients".format(self.test_patients))
-
-        self.max_time_steps = env_params['max_time_steps']
-        self.time_step_limit = env_params['time_step_limit']
-        self.no_nop = env_params['no_nop']
-        self.action_memory = env_params['prev_actions']
-        self.frame_history = env_params['prev_frames']
-        self.shuffles = env_params['shuffles']
-        self.defined_test_set = env_params['test_set']
-        self.defined_val_set = env_params['val_set']
-
-        if self.verbose > 0 and self.chebishev:
-            print("Training with Chebishev distance!")
-
-        if not env_params['data_path']:
-            raise ValueError('Valid patient file is needed for this environment to work')
-
-        self.counter = 0                                                        # Timestep counter in each episode
-        self.correct_counter = 0                                                # Correct decision counter each episode
-        self.num_rows = 11                                                      # Grid heigth component
-        self.num_cols = 15                                                      # Grid width component
-        self.max_row = self.num_rows - 1                                        # Vertical movement limitation
-        self.max_cols = self.num_cols - 1                                       # Horizontal movement limitation
-
-        patient_files = os.listdir(env_params['data_path'] + "Patient_files/")
-        [patient_files.remove(pat_file) if not ".txt" in pat_file else "" for pat_file in patient_files]
-        patient_files.sort()
-        print(patient_files)
+        patient_files = self.get_patient_files()
         self.training = True
 
-        self.num_patients = len(patient_files)                                  # Total n° patients
-        patient_idxs = np.array(list(range(self.num_patients)))
-        np.random.shuffle(patient_idxs)
-
-        if np.any(self.defined_test_set):
-            self.test_patient_idxs = self.defined_test_set
-            rest_patients = np.array([patient for patient in patient_idxs if patient not in self.test_patient_idxs])
-        else:
-            self.test_patient_idxs, rest_patients = np.split(patient_idxs, [self.test_patients])
-
-        if np.any(self.defined_val_set):
-            self.val_patient_idxs = self.defined_val_set
-            self.train_patient_idxs = np.array(
-                [patient for patient in rest_patients if patient not in self.val_patient_idxs])
-        else:
-            for _ in range(self.shuffles):
-                np.random.shuffle(rest_patients)
-            self.val_patient_idxs, self.train_patient_idxs = np.split(rest_patients, [self.val_patients])
-
-        if self.verbose > 0: print(self.train_patient_idxs)
-        if self.verbose > 0: print(self.val_patient_idxs)
-        if self.verbose > 0: print(self.test_patient_idxs)
+        self.define_env_sets(patient_files)
 
         self.patient_idx = self.reset_patient()  # Current patient index
         self.goals = []                                                         # Goal coordinates for patients - y * row_size + x format
         self.goal_avg = []                                                      # Center of goals for distance calculation
         self.frames_per_state = 5
         self.frames = []                                                        # US-frames for DQN input
-
-        self.num_states = self.num_rows * self.num_cols
-        self.val_reachability = 0
-
-        if self.chebishev:
-            self.action_space = spaces.Discrete(9)
-            self.num_actions = 9  # 0 - UP | 1 - DOWN | 2 - LEFT | 3 - RIGHT | 4 - NOP | 5 - NE | 6 - SE | 7 - SW | 8 - NW
-        elif self.no_nop:
-            self.action_space = spaces.Discrete(4)
-            self.num_actions = 4  # 0 - UP | 1 - DOWN | 2 - LEFT | 3 - RIGHT
-        else:
-            self.action_space = spaces.Discrete(5)
-            self.num_actions = 5  # 0 - UP | 1 - DOWN | 2 - LEFT | 3 - RIGHT | 4 - NOP
-
-        self.observation_space = spaces.Box(low=0, high=1, shape=(self.resize_x, self.resize_y, self.frame_history + 1),
-                                            dtype=np.float)
+        
+        self.set_action_space()
+        self.set_observation_space()
 
         self.state = self.reset_state()
 
         self.prev_actions = np.zeros(self.num_actions * self.action_memory)
         self.prev_frames = np.zeros((self.frame_history), dtype=int)
 
+        self.load_patient_frames(env_params, patient_files)
+        self.transition_dict = self.build_transition_dict()
+
+        if self.verbose > 0:
+            print("Environment loaded!")
+            print("Training patients: {}".format(",".join(map(str, self.train_patient_idxs))))
+            print("Testing patients: {}".format(",".join(map(str, self.test_patient_idxs))))
+
+    def define_reward_function(self, env_params):
+        self.reward_dict = {'goal_correct': env_params['reward_goal_correct'],
+                            'goal_incorrect': env_params['reward_goal_incorrect'],
+                            'closer': env_params['reward_move_closer'],
+                            'further': env_params['reward_move_further'],
+                            'border_collision': env_params['reward_border_collision']}
+
+    def load_patient_frames(self, env_params, patient_files):
         pat_counter = 0
         for i, patient in zip(range(len(patient_files)), patient_files):
             pat_counter += 1
@@ -111,18 +62,85 @@ class SacrumNavEnv(gym.Env):
             self.goal_avg.append(goal_avg)
             if self.verbose > 0: print("Patient {}/{} loaded!".format(pat_counter, self.num_patients))
 
-        self.reward_dict = {'goal_correct': 1.0,  # 1.0
-                            'goal_incorrect': -0.25,  # -0.25
-                            'closer': 0.05,  # 0.05
-                            'border_collision': -0.1,  # -0.25
-                            'further': -0.1}  # -0.1
+    def set_observation_space(self):
+        self.observation_space = spaces.Box(low=0, high=1, shape=(self.resize_x, self.resize_y, self.frame_history + 1),
+                                            dtype=np.float)
 
-        self.P = self.build_transition_dict()
+    def set_action_space(self):
+        if self.chebishev:
+            self.action_space = spaces.Discrete(9)
+            self.num_actions = 9  # 0 - UP | 1 - DOWN | 2 - LEFT | 3 - RIGHT | 4 - NOP | 5 - NE | 6 - SE | 7 - SW | 8 - NW
+        elif self.no_nop:
+            self.action_space = spaces.Discrete(4)
+            self.num_actions = 4  # 0 - UP | 1 - DOWN | 2 - LEFT | 3 - RIGHT
+        else:
+            self.action_space = spaces.Discrete(5)
+            self.num_actions = 5  # 0 - UP | 1 - DOWN | 2 - LEFT | 3 - RIGHT | 4 - NOP
 
+    def get_patient_files(self):
+        patient_files = os.listdir(self.data_path + "Patient_files/")
+        [patient_files.remove(pat_file) if not ".txt" in pat_file else "" for pat_file in patient_files]
+        patient_files.sort()
+        print(patient_files)
+        return patient_files
+
+    def define_env_sets(self, patient_files):
+        self.num_patients = len(patient_files)  # Total n° patients
+        patient_idxs = np.array(list(range(self.num_patients)))
+        np.random.shuffle(patient_idxs)
+        if np.any(self.defined_test_set):
+            self.test_patient_idxs = self.defined_test_set
+            rest_patients = np.array([patient for patient in patient_idxs if patient not in self.test_patient_idxs])
+        else:
+            self.test_patient_idxs, rest_patients = np.split(patient_idxs, [self.test_patients])
+        if np.any(self.defined_val_set):
+            self.val_patient_idxs = self.defined_val_set
+            self.train_patient_idxs = np.array(
+                [patient for patient in rest_patients if patient not in self.val_patient_idxs])
+        else:
+            for _ in range(self.shuffles):
+                np.random.shuffle(rest_patients)
+            self.val_patient_idxs, self.train_patient_idxs = np.split(rest_patients, [self.val_patients])
         if self.verbose > 0:
-            print("Environment loaded!")
-            print("Training patients: {}".format(",".join(map(str, self.train_patient_idxs))))
-            print("Testing patients: {}".format(",".join(map(str, self.test_patient_idxs))))
+            print(self.train_patient_idxs)
+            print(self.val_patient_idxs)
+            print(self.test_patient_idxs)
+
+    def set_env_constants(self):
+        self.resize_x = 272
+        self.resize_y = 258
+        self.counter = 0  # Timestep counter in each episode
+        self.correct_counter = 0  # Correct decision counter each episode
+        self.num_rows = 11  # Grid heigth component
+        self.num_cols = 15  # Grid width component
+        self.max_row = self.num_rows - 1  # Vertical movement limitation
+        self.max_cols = self.num_cols - 1  # Horizontal movement limitation
+        self.val_reachability = 0
+        self.num_states = self.num_rows * self.num_cols
+
+    def set_env_variables(self, env_params):
+        self.verbose = env_params['verbose']
+        self.chebishev = env_params['chebishev']
+        if self.verbose > 0 and self.chebishev: print("Training with Chebishev distance!")
+
+        self.test_patients = env_params['test_patients']
+        self.val_patients = env_params['val_patients']
+        if self.verbose > 0:
+            print("Validating on {} patients".format(self.val_patients))
+            print("Testing on {} patients".format(self.test_patients))
+
+        self.max_time_steps = env_params['max_time_steps']
+        self.time_step_limit = env_params['time_step_limit']
+        self.no_nop = env_params['no_nop']
+        self.action_memory = env_params['prev_actions']
+        self.frame_history = env_params['prev_frames']
+        self.shuffles = env_params['shuffles']
+        self.defined_test_set = env_params['test_set']
+        self.defined_val_set = env_params['val_set']
+        if not env_params['data_path']:
+            raise ValueError('Valid patient file is needed for this environment to work')
+
+        self.data_path = env_params['data_path']
 
     def step(self, action):
         if self.counter == 0 and self.verbose > 1: print("Changing to patient nr {}".format(self.patient_idx))
@@ -130,7 +148,7 @@ class SacrumNavEnv(gym.Env):
         info = dict()
         if self.verbose > 1: print("Training step {} - coords: {},{} doing {}!".format(self.counter, self.get_row(self.state), self.get_col(self.state), action))
 
-        transition = self.P[self.patient_idx][self.state][action]
+        transition = self.transition_dict[self.patient_idx][self.state][action]
 
         p, state, reward, done = transition[0]
         goals = self.goals[self.patient_idx]
@@ -328,7 +346,7 @@ class SacrumNavEnv(gym.Env):
 
         for state in states:
             row, col = self.val_to_coords(state)
-            transition_tuple = self.P[patient][state][actions[state]]
+            transition_tuple = self.transition_dict[patient][state][actions[state]]
 
             reward = transition_tuple[0][2]
 
@@ -425,7 +443,7 @@ class SacrumNavEnv(gym.Env):
     def test_model(self, states, actions, test_patient):
         correctness = 0
         for state in states:
-            transition_tuple = self.P[test_patient][state][actions[state]]
+            transition_tuple = self.transition_dict[test_patient][state][actions[state]]
 
             if self.no_nop and state in self.goals[test_patient]:
                 reward = 1.0
